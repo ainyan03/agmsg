@@ -317,11 +317,23 @@ _remote_http_post_json() {
     printf 'max-filesize = "2097152"\n'
     printf 'data = "@%s"\n' "$body_file"
   } > "$cfg"
-  if curl_output=$(curl -sS -o "$out_file" -w '%{http_code}' -K "$cfg" 2>/dev/null); then
+  # Do not discard curl's stderr. On failure it is the only record of WHY, and
+  # the caller only ever sees the HTTP code — which this function reports as
+  # "000" for every kind of failure alike. A Windows run spent a long time on a
+  # bare 000 whose cause (curl could not open a path embedded in the config)
+  # was sitting in the stderr this line was throwing away.
+  #
+  # Captured rather than passed through, and shown only when curl actually
+  # failed: on the success path curl -sS is already silent, and a stray write
+  # to stderr here would land in the middle of a caller's output.
+  local curl_err; curl_err="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-err.XXXXXX")"
+  if curl_output=$(curl -sS -o "$out_file" -w '%{http_code}' -K "$cfg" 2>"$curl_err"); then
     :
   else
     curl_status=$?
   fi
+  [ "$curl_status" -ne 0 ] && [ -s "$curl_err" ] && cat "$curl_err" >&2
+  rm -f "$curl_err"
   if [ "$curl_status" -ne 0 ]; then
     kill "$copier_pid" 2>/dev/null || true
     wait "$copier_pid" 2>/dev/null || true
