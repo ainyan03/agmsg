@@ -291,13 +291,33 @@ cmd_doctor() {
 # config file is 0600 and removed immediately after the call.
 _remote_http_post_json() {
   local url="$1" body_file="$2" out_file="$3" header_file="$4" cfg http_code \
-    fifo_dir header_fifo copier_pid curl_output curl_status=0
+    fifo_dir header_fifo copier_pid curl_output curl_status=0 curl_err
   cfg="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-cfg.XXXXXX")"
   fifo_dir="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-header-pipe.XXXXXX")"
   header_fifo="$fifo_dir/header"
+  # Made here rather than beside curl, so everything this function creates
+  # exists before the trap that has to remove it.
+  curl_err="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-err.XXXXXX")"
   mkfifo "$header_fifo"
   chmod 600 "$cfg"
-  trap 'rm -f "$cfg" "$header_fifo"; rmdir "$fifo_dir" 2>/dev/null || true' EXIT INT TERM
+  # THE PATHS ARE BAKED IN, NOT EXPANDED WHEN THE TRAP FIRES.
+  #
+  # An EXIT trap set inside a function runs after that function's frame is
+  # gone, so a single-quoted body expands `$cfg` in the CALLER's scope, where a
+  # local of that name does not exist. It removes "" and returns 0, and the
+  # cleanup reads as working. Measured both ways on bash 3.2.57 and 5.3.15: a
+  # local is EMPTY inside an EXIT trap fired by errexit from within the
+  # function.
+  #
+  # That was already true of `cfg`, `header_fifo` and `fifo_dir` before this
+  # change, so the pre-existing trap has never cleaned up an early exit -- a
+  # measured run left all three behind, including a 0600 config naming the
+  # request body. `printf %q` fixes the values at set time and survives a
+  # TMPDIR with spaces in it.
+  #
+  # The explicit cleanup at the tail stays: it is what runs on the normal
+  # paths, and it runs before `trap -` clears this.
+  trap "rm -f $(printf '%q %q %q' "$cfg" "$header_fifo" "$curl_err"); rmdir $(printf '%q' "$fifo_dir") 2>/dev/null || true" EXIT INT TERM
   # Reaped on both normal paths below (waited on success, killed and waited on
   # failure), so this is short-lived by construction -- but the EXIT trap only
   # removes files, it does not kill the copier. A signal arriving before curl
@@ -326,7 +346,6 @@ _remote_http_post_json() {
   # Captured rather than passed through, and shown only when curl actually
   # failed: on the success path curl -sS is already silent, and a stray write
   # to stderr here would land in the middle of a caller's output.
-  local curl_err; curl_err="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-err.XXXXXX")"
   if curl_output=$(curl -sS -o "$out_file" -w '%{http_code}' -K "$cfg" 2>"$curl_err"); then
     :
   else

@@ -46,12 +46,16 @@ for arg in "$@"; do
   prev="$arg"
 done
 [ -z "${STUB_CURL_STDERR:-}" ] || printf '%s\n' "$STUB_CURL_STDERR" >&2
-if [ "${STUB_CURL_MODE:-ok}" = "fail" ]; then
-  # A real curl that cannot open a config path exits non-zero and writes
-  # nothing to the output file. Exit 26 is curl's "read error".
-  exit 26
-fi
 hdr="$(sed -n 's/^dump-header = "\(.*\)"$/\1/p' "$cfg")"
+if [ "${STUB_CURL_MODE:-ok}" = "fail" ]; then
+  # A failure AFTER the headers were written -- curl exceeding max-filesize on
+  # the body, say. The headers matter here: leaving the fifo without a writer
+  # strands the bounded copier on open(), and everything downstream of that
+  # waits on a process that will never finish. That is a real property of the
+  # failure path, and driving it is a different experiment from this one.
+  [ -z "$hdr" ] || printf 'HTTP/1.1 200 OK\r\n\r\n' > "$hdr"
+  exit 63
+fi
 [ -z "$hdr" ] || printf 'HTTP/1.1 200 OK\r\n\r\n' > "$hdr"
 [ -z "$out" ] || printf '{"ok":true}' > "$out"
 printf '200'
@@ -136,6 +140,71 @@ post_with_curl() {
   [ "$output" = "000" ]
   refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
   refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+}
+
+@test "an early exit between the mktemp and the cleanup still sweeps the file (#850)" {
+  # The hole the explicit cleanup cannot cover: it only runs if the function
+  # GETS there. A signal is the obvious way out early and it is also the one I
+  # could not drive -- the probe hung, because the bounded copier keeps the run
+  # alive while curl is being waited on. A review pointed out that the signal is
+  # not the only exit, and errexit is a bounded one.
+  #
+  # `cat` is the last command of the `&& &&` chain that shows the diagnosis, so
+  # under `set -e` a failing cat leaves the function immediately -- after the
+  # mktemp, before the rm. Everything that survives that has to come from the
+  # trap, which is exactly the property under test.
+  RUN_TMPDIR="$(mktemp -d "$BATS_TEST_TMPDIR/run.XXXXXX")"
+  local bin; bin="$(sandbox_path)"
+  local body="$RUN_TMPDIR/body.json"
+  printf '{"t":"secret"}' > "$body"
+
+  # A `cat` that always fails, shadowing the real one for this run only. The
+  # symlink is REMOVED first: `>` through a symlink writes to its target, which
+  # here is the system's own /bin/cat. The first attempt did exactly that and
+  # was refused by the OS -- on a machine where it was not refused, this test
+  # would have replaced a system binary.
+  rm -f "$bin/cat"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$bin/cat"
+  chmod +x "$bin/cat"
+
+  # Output goes to FILES, not to bats's capture pipe. On this path the bounded
+  # copier is never reaped -- the trap removes files and does not kill it -- so
+  # it outlives the shell still holding the inherited stdout and stderr. Those
+  # being a pipe is what makes `run` wait forever; those being files is what
+  # makes this test finish. The orphan is a real property of the early-exit
+  # path and is reported alongside this test rather than papered over.
+  run env PATH="$bin" TMPDIR="$RUN_TMPDIR" STUB_CURL_MODE=fail \
+    STUB_CURL_STDERR="curl: (26) Failed to open/read local data" bash -c '
+    set -euo pipefail
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
+    _remote_http_post_json "https://example.invalid/v1/x" "'"$body"'" \
+      "'"$RUN_TMPDIR"'/out-body" "'"$RUN_TMPDIR"'/out-header"
+  ' >"$RUN_TMPDIR/driver-stdout" 2>"$RUN_TMPDIR/driver-stderr"
+  # It leaves early: the function never reaches its `printf` of the code.
+  [ "$status" -ne 0 ]
+  [ ! -s "$RUN_TMPDIR/driver-stdout" ]
+
+  # And nothing is stranded. This is the trap's work, not the tail's -- and all
+  # three are asserted, because measuring this path is what showed the trap had
+  # never swept ANY of them. It expanded function locals after the frame was
+  # gone, removed empty strings, and returned 0.
+  refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
+  refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+  refute ls -d "$RUN_TMPDIR"/agmsg-header-pipe.* 2>/dev/null
+}
+
+@test "an EXIT trap cannot read the locals of the function that set it (#850)" {
+  # The premise the trap's shape rests on, measured here rather than asserted
+  # in a comment. If a future bash made locals visible to an EXIT trap, the
+  # `printf %q` baking would look like pointless ceremony and someone would
+  # simplify it back into a single-quoted body -- reopening the leak. This test
+  # is what tells them the ceremony is load-bearing.
+  run bash -c '
+    f() { local v="hello"; trap '"'"'printf "TRAP_SEES=[%s]\n" "${v:-EMPTY}"'"'"' EXIT; false; }
+    set -e
+    f
+  '
+  [ "$output" = "TRAP_SEES=[EMPTY]" ]
 }
 
 @test "the leftover check can see a leftover when there is one (#850)" {
