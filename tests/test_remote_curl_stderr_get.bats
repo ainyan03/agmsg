@@ -122,6 +122,36 @@ get_with_curl() {
   refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
 }
 
+@test "GET: an early exit between the mktemp and the cleanup still sweeps both files (#850)" {
+  # The same hole as the POST side, and the same bounded way in: `cat` is the
+  # last command of the chain that shows the diagnosis, so a failing cat under
+  # `set -e` leaves the function after the mktemp and before the rm.
+  #
+  # This helper has no fifo and no copier, so nothing here can strand a reader
+  # -- which makes it the cheaper of the two to drive, and it is still the same
+  # property: whatever survives an early exit came from the trap.
+  RUN_TMPDIR="$(mktemp -d "$BATS_TEST_TMPDIR/run.XXXXXX")"
+  local bin; bin="$(sandbox_path)"
+
+  # The symlink is removed before writing: `>` follows a symlink to its target,
+  # which here would be the system's own /bin/cat.
+  rm -f "$bin/cat"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$bin/cat"
+  chmod +x "$bin/cat"
+
+  run env PATH="$bin" TMPDIR="$RUN_TMPDIR" STUB_CURL_MODE=fail \
+    STUB_CURL_STDERR="curl: (7) Failed to connect" bash -c '
+    set -euo pipefail
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
+    _remote_http_get_json "https://example.invalid/v1/teams" "team-abc" \
+      "'"$RUN_TMPDIR"'/out-body"
+  '
+  [ "$status" -ne 0 ]
+
+  refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
+  refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+}
+
 @test "GET: the leftover check can see a leftover when there is one (#850)" {
   # Control on the absence above: a glob matching nothing looks the same as a
   # glob aimed at the wrong directory.

@@ -379,10 +379,16 @@ _remote_http_post_json() {
 # Nothing else is sent, because there is nothing else to send: this protocol
 # carries no credential at all (see cmd_connect).
 _remote_http_get_json() {
-  local url="$1" team_id="$2" out_file="$3" cfg curl_output curl_status=0
+  local url="$1" team_id="$2" out_file="$3" cfg curl_output curl_status=0 curl_err
   cfg="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-cfg.XXXXXX")"
+  # Made with the config, so both exist before the trap that has to remove them.
+  curl_err="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-err.XXXXXX")"
   chmod 600 "$cfg"
-  trap 'rm -f "$cfg"' EXIT INT TERM
+  # Baked in with printf %q rather than expanded when the trap fires — the same
+  # reason as the POST helper: an EXIT trap set inside a function runs after
+  # that function's frame is gone, so a single-quoted `$cfg` expands to nothing
+  # in the caller's scope and the cleanup silently removes an empty string.
+  trap "rm -f $(printf '%q %q' "$cfg" "$curl_err")" EXIT INT TERM
   {
     printf 'url = "%s"\n' "$url"
     printf 'request = "GET"\n'
@@ -396,7 +402,6 @@ _remote_http_get_json() {
   # thing anyone sees, and "000" is what this reports for every failure alike.
   # `pull` goes through here, so a failure on this path was as undiagnosable as
   # the connect one that cost a Windows run its afternoon.
-  local curl_err; curl_err="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-err.XXXXXX")"
   if curl_output=$(curl -sS -o "$out_file" -w '%{http_code}' -K "$cfg" 2>"$curl_err"); then
     :
   else
