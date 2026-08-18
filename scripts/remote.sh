@@ -379,16 +379,19 @@ _remote_http_post_json() {
 # Nothing else is sent, because there is nothing else to send: this protocol
 # carries no credential at all (see cmd_connect).
 _remote_http_get_json() {
-  local url="$1" team_id="$2" out_file="$3" cfg curl_output curl_status=0 curl_err
-  cfg="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-cfg.XXXXXX")"
-  # Made with the config, so both exist before the trap that has to remove them.
-  curl_err="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-err.XXXXXX")"
+  local url="$1" team_id="$2" out_file="$3" cfg curl_output curl_status=0 \
+    curl_err work_dir
+  # One allocation, then the trap, then everything else inside it — the same
+  # shape as the POST helper, and for the same two reasons. A trap set inside a
+  # function cannot expand that function's locals when it fires, so the paths
+  # are baked in with printf %q; and anything created before the trap is armed
+  # is unprotected, so only one thing is.
+  work_dir="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-curl.XXXXXX")"
+  trap "rm -rf $(printf '%q' "$work_dir")" EXIT INT TERM
+  cfg="$work_dir/config"
+  curl_err="$work_dir/stderr"
+  : > "$cfg"
   chmod 600 "$cfg"
-  # Baked in with printf %q rather than expanded when the trap fires — the same
-  # reason as the POST helper: an EXIT trap set inside a function runs after
-  # that function's frame is gone, so a single-quoted `$cfg` expands to nothing
-  # in the caller's scope and the cleanup silently removes an empty string.
-  trap "rm -f $(printf '%q %q' "$cfg" "$curl_err")" EXIT INT TERM
   {
     printf 'url = "%s"\n' "$url"
     printf 'request = "GET"\n'
@@ -408,9 +411,10 @@ _remote_http_get_json() {
     curl_status=$?
   fi
   [ "$curl_status" -ne 0 ] && [ -s "$curl_err" ] && cat "$curl_err" >&2
-  rm -f "$curl_err"
   [ "$curl_status" -eq 0 ] || curl_output="000"
-  rm -f "$cfg"
+  # The config and the error file are both inside it, so the normal path
+  # removes exactly what the trap would have.
+  rm -rf "$work_dir"
   trap - EXIT INT TERM
   printf '%s' "$curl_output"
 }

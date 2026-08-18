@@ -111,15 +111,17 @@ get_with_curl() {
 @test "GET: no scratch file is left behind, on either path (#850)" {
   # This helper writes a config and now an error file, and removes both. Each
   # run gets a private TMPDIR so the question is about this call only.
+  # THE NAME MATTERS. An earlier version globbed agmsg-curl-cfg.* and
+  # agmsg-curl-err.*, which this layout never creates -- the check would pass on
+  # any behaviour at all, including a leaked directory. An absence assertion
+  # aimed at a name nothing uses is indistinguishable from a clean run.
   get_with_curl ok ""
   [ "$output" = "200" ]
-  refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
-  refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
 
   get_with_curl fail "curl: (28) Operation timed out"
   [ "$output" = "000" ]
-  refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
-  refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
 }
 
 @test "GET: an early exit between the mktemp and the cleanup still sweeps both files (#850)" {
@@ -148,16 +150,42 @@ get_with_curl() {
   '
   [ "$status" -ne 0 ]
 
-  refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
-  refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
+}
+
+@test "GET: a failure while setting up leaves nothing behind either (#850)" {
+  # The window review found: whatever exists before the trap is armed is
+  # unprotected, and there is always a first allocation. There is now exactly
+  # one, and everything else is made inside it.
+  #
+  # Driven by making `chmod` fail, which happens after the directory exists and
+  # after the config has been created inside it.
+  RUN_TMPDIR="$(mktemp -d "$BATS_TEST_TMPDIR/run.XXXXXX")"
+  local bin; bin="$(sandbox_path)"
+
+  rm -f "$bin/chmod"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$bin/chmod"
+  chmod +x "$bin/chmod"
+
+  run env PATH="$bin" TMPDIR="$RUN_TMPDIR" bash -c '
+    set -euo pipefail
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
+    _remote_http_get_json "https://example.invalid/v1/teams" "team-abc" \
+      "'"$RUN_TMPDIR"'/out-body"
+  '
+  [ "$status" -ne 0 ]
+
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
 }
 
 @test "GET: the leftover check can see a leftover when there is one (#850)" {
   # Control on the absence above: a glob matching nothing looks the same as a
   # glob aimed at the wrong directory.
+  # Planted under the name the helper really mints, so this controls the glob
+  # the absence assertions actually run.
   get_with_curl ok ""
-  : > "$RUN_TMPDIR/agmsg-curl-err.planted"
-  run ls "$RUN_TMPDIR"/agmsg-curl-err.*
+  mkdir -p "$RUN_TMPDIR/agmsg-curl.planted"
+  run ls -d "$RUN_TMPDIR"/agmsg-curl.*
   [ "$status" -eq 0 ]
 }
 
