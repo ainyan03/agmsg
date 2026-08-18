@@ -291,33 +291,39 @@ cmd_doctor() {
 # config file is 0600 and removed immediately after the call.
 _remote_http_post_json() {
   local url="$1" body_file="$2" out_file="$3" header_file="$4" cfg http_code \
-    fifo_dir header_fifo copier_pid curl_output curl_status=0 curl_err
-  cfg="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-cfg.XXXXXX")"
-  fifo_dir="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-header-pipe.XXXXXX")"
-  header_fifo="$fifo_dir/header"
-  # Made here rather than beside curl, so everything this function creates
-  # exists before the trap that has to remove it.
-  curl_err="$(mktemp "${TMPDIR:-/tmp}/agmsg-curl-err.XXXXXX")"
-  mkfifo "$header_fifo"
+    work_dir header_fifo copier_pid curl_output curl_status=0 curl_err
+  # ONE ALLOCATION BEFORE THE TRAP, AND EVERYTHING ELSE INSIDE IT.
+  #
+  # Two separate things go wrong with the obvious ordering, and this shape is
+  # the smallest one that closes both.
+  #
+  # First, a trap cannot expand what it cannot see. An EXIT trap set inside a
+  # function runs after that function's frame is gone, so a single-quoted body
+  # expands `$cfg` in the CALLER's scope, where no local of that name exists.
+  # It removes "" and returns 0, so the cleanup reads as working. Measured on
+  # bash 3.2.57 and 5.3.15: a local is EMPTY inside an EXIT trap fired by
+  # errexit from within the function. `printf %q` fixes the value at set time
+  # and survives a TMPDIR containing spaces.
+  #
+  # Second, anything created BEFORE the trap is armed is unprotected. Creating
+  # the config, then a directory, then an error file, and only then arming the
+  # trap leaves a window where the second or third allocation fails and the
+  # first is stranded -- including a 0600 config naming the request body. The
+  # window cannot be closed by ordering alone, because there is always a first
+  # allocation.
+  #
+  # So: acquire ONE directory, arm the trap on it immediately, and create
+  # everything else inside. A failure at any later step leaves nothing outside
+  # a directory that is already condemned. `rm -rf` on a path this function
+  # minted is the whole cleanup.
+  work_dir="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-curl.XXXXXX")"
+  trap "rm -rf $(printf '%q' "$work_dir")" EXIT INT TERM
+  cfg="$work_dir/config"
+  curl_err="$work_dir/stderr"
+  header_fifo="$work_dir/header"
+  : > "$cfg"
   chmod 600 "$cfg"
-  # THE PATHS ARE BAKED IN, NOT EXPANDED WHEN THE TRAP FIRES.
-  #
-  # An EXIT trap set inside a function runs after that function's frame is
-  # gone, so a single-quoted body expands `$cfg` in the CALLER's scope, where a
-  # local of that name does not exist. It removes "" and returns 0, and the
-  # cleanup reads as working. Measured both ways on bash 3.2.57 and 5.3.15: a
-  # local is EMPTY inside an EXIT trap fired by errexit from within the
-  # function.
-  #
-  # That was already true of `cfg`, `header_fifo` and `fifo_dir` before this
-  # change, so the pre-existing trap has never cleaned up an early exit -- a
-  # measured run left all three behind, including a 0600 config naming the
-  # request body. `printf %q` fixes the values at set time and survives a
-  # TMPDIR with spaces in it.
-  #
-  # The explicit cleanup at the tail stays: it is what runs on the normal
-  # paths, and it runs before `trap -` clears this.
-  trap "rm -f $(printf '%q %q %q' "$cfg" "$header_fifo" "$curl_err"); rmdir $(printf '%q' "$fifo_dir") 2>/dev/null || true" EXIT INT TERM
+  mkfifo "$header_fifo"
   # Reaped on both normal paths below (waited on success, killed and waited on
   # failure), so this is short-lived by construction -- but the EXIT trap only
   # removes files, it does not kill the copier. A signal arriving before curl
@@ -352,7 +358,6 @@ _remote_http_post_json() {
     curl_status=$?
   fi
   [ "$curl_status" -ne 0 ] && [ -s "$curl_err" ] && cat "$curl_err" >&2
-  rm -f "$curl_err"
   if [ "$curl_status" -ne 0 ]; then
     kill "$copier_pid" 2>/dev/null || true
     wait "$copier_pid" 2>/dev/null || true
@@ -362,8 +367,9 @@ _remote_http_post_json() {
   else
     http_code="000"
   fi
-  rm -f "$cfg" "$header_fifo"
-  rmdir "$fifo_dir" 2>/dev/null || true
+  # One directory holds the config, the error file and the fifo, so the normal
+  # path removes exactly what the trap would have.
+  rm -rf "$work_dir"
   trap - EXIT INT TERM
   printf '%s' "$http_code"
 }

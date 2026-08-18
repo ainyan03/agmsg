@@ -128,18 +128,21 @@ post_with_curl() {
 }
 
 @test "no scratch file is left behind, on either path (#850)" {
-  # The helper writes a config, a fifo directory and now an error file. All of
-  # them are removed on the normal paths; this asserts it for the run's own
-  # TMPDIR, so nothing else on the machine can make the check pass or fail.
+  # The config, the error file and the fifo now live in one directory the helper
+  # mints, so this is one glob rather than three.
+  #
+  # THE NAME MATTERS AND ALMOST GOT THIS WRONG. An earlier version of this test
+  # globbed agmsg-curl-cfg.* and agmsg-curl-err.*, which the new layout never
+  # creates -- the check would have passed on any behaviour whatsoever, and gone
+  # on passing if the directory leaked. An absence assertion aimed at a name
+  # nothing uses is indistinguishable from a clean run.
   post_with_curl ok ""
   [ "$output" = "200" ]
-  refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
-  refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
 
   post_with_curl fail "curl: (7) Failed to connect"
   [ "$output" = "000" ]
-  refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
-  refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
 }
 
 @test "an early exit between the mktemp and the cleanup still sweeps the file (#850)" {
@@ -190,7 +193,39 @@ post_with_curl() {
   # gone, removed empty strings, and returned 0.
   refute ls "$RUN_TMPDIR"/agmsg-curl-err.* 2>/dev/null
   refute ls "$RUN_TMPDIR"/agmsg-curl-cfg.* 2>/dev/null
-  refute ls -d "$RUN_TMPDIR"/agmsg-header-pipe.* 2>/dev/null
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
+}
+
+@test "a failure while setting up leaves nothing behind either (#850)" {
+  # The window the previous shape could not close: anything created BEFORE the
+  # trap is armed is unprotected, and there is always a first allocation. The
+  # answer is that there is now only ONE allocation before the trap, and
+  # everything else is made inside it.
+  #
+  # Driven by making `mkfifo` fail, which happens after the directory exists and
+  # after the config has been written into it. Under `set -e` that leaves the
+  # function immediately -- before curl, before any cleanup the tail would do.
+  RUN_TMPDIR="$(mktemp -d "$BATS_TEST_TMPDIR/run.XXXXXX")"
+  local bin; bin="$(sandbox_path)"
+  local body="$RUN_TMPDIR/body.json"
+  printf '{"t":"secret"}' > "$body"
+
+  rm -f "$bin/mkfifo"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$bin/mkfifo"
+  chmod +x "$bin/mkfifo"
+
+  run env PATH="$bin" TMPDIR="$RUN_TMPDIR" bash -c '
+    set -euo pipefail
+    . '"$SCRIPTS"'/remote.sh 2>/dev/null
+    _remote_http_post_json "https://example.invalid/v1/x" "'"$body"'" \
+      "'"$RUN_TMPDIR"'/out-body" "'"$RUN_TMPDIR"'/out-header"
+  '
+  [ "$status" -ne 0 ]
+
+  # Nothing survives: not the directory, and so not the config inside it. The
+  # config is the file that matters -- it is what this helper exists to keep
+  # out of curl's argv, and a stranded copy names the request body.
+  refute ls -d "$RUN_TMPDIR"/agmsg-curl.* 2>/dev/null
 }
 
 @test "an EXIT trap cannot read the locals of the function that set it (#850)" {
@@ -211,8 +246,10 @@ post_with_curl() {
   # Control on the assertion above, which is an absence: a glob that matches
   # nothing looks exactly like a glob pointed at the wrong directory. Plant one
   # and confirm the same check fires.
+  # Planted under the name the helper really uses, so this controls the glob
+  # that the absence assertions actually run.
   post_with_curl ok ""
-  : > "$RUN_TMPDIR/agmsg-curl-err.planted"
-  run ls "$RUN_TMPDIR"/agmsg-curl-err.*
+  mkdir -p "$RUN_TMPDIR/agmsg-curl.planted"
+  run ls -d "$RUN_TMPDIR"/agmsg-curl.*
   [ "$status" -eq 0 ]
 }
