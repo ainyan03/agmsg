@@ -305,3 +305,5 @@ else
   echo "  Nothing removed."
 fi
 echo ""
+
+# CI probe: no-op comment to exercise the full suite on a fork branch.
