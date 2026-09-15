@@ -106,6 +106,37 @@ fake_session() {
   [ "$(agmsg_role_session_uuid T alice)" = "sid-new" ]
 }
 
+@test "forget_seat: removes only session and preserves the remaining record" {
+  agmsg_role_session_record T alice "sid-old" /tmp/p1 codex owner-1
+  agmsg_role_session_mark_named T alice "tmux:%4" epoch-1
+  local f before after
+  f=$(_role_session_path T alice)
+  before="$(sed '/^session=/d; /^retired_session=/d' "$f")"
+
+  agmsg_role_session_forget_seat T alice
+
+  [ -z "$(agmsg_role_session_uuid T alice)" ]
+  [ "$(agmsg_role_session_get T alice retired_session)" = "sid-old" ]
+  after="$(sed '/^retired_session=/d' "$f")"
+  [ "$after" = "$before" ]
+
+  run agmsg_role_session_recorded_uuids codex
+  printf '%s\n' "$output" | grep -qx sid-old
+
+  # A re-seat keeps the tombstone: the retired thread is still loaded in a
+  # shared app-server, so a later fresh seat must still subtract it.
+  agmsg_role_session_record T alice "sid-new" /tmp/p1 codex owner-2
+  [ "$(agmsg_role_session_uuid T alice)" = "sid-new" ]
+  [ "$(agmsg_role_session_get T alice retired_session)" = "sid-old" ]
+
+  # A second fresh seat retires sid-new in front of sid-old, and inference sees both.
+  agmsg_role_session_forget_seat T alice
+  [ "$(sed -n 's/^retired_session=//p' "$f" | paste -sd, -)" = "sid-new,sid-old" ]
+  run agmsg_role_session_recorded_uuids codex
+  printf '%s\n' "$output" | grep -qx sid-old
+  printf '%s\n' "$output" | grep -qx sid-new
+}
+
 @test "record: unicode team name roundtrips" {
   agmsg_role_session_record "チーム" alice "sid-jp" /tmp/p1
   [ "$(agmsg_role_session_uuid "チーム" alice)" = "sid-jp" ]

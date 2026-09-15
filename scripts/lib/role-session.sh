@@ -141,9 +141,14 @@ agmsg_role_session_load() {
 agmsg_role_session_record() {
   local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}" owner="${6:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$bare_sid" ] || return 0
-  local path dir tmp ts named_ref="" named_epoch="" named_at=""
+  local path dir tmp ts named_ref="" named_epoch="" named_at="" retired=""
   _agmsg_role_session_path_into "$team" "$agent"
   path="$_AGMSG_ROLE_SESSION_PATH"
+  [ ! -f "$path" ] || retired="$(grep '^retired_session=' "$path" 2>/dev/null || true)"
+  # Retired seats (see agmsg_role_session_forget_seat) ride along unchanged: the
+  # threads they name stay loaded in a shared app-server for as long as it
+  # lives, so they must keep being subtracted from later seat inference (#579)
+  # even after this role has been re-seated once or twice since.
   # The naming mark (named_ref / named_at, see agmsg_role_session_mark_named)
   # survives a re-record: this function rewrites the session fields, and the
   # mark is a fact about the PANE, not about the session. Dropping it here
@@ -164,12 +169,46 @@ agmsg_role_session_record() {
     printf 'project=%s\n' "$project"
     [ -z "$owner" ] || printf 'owner=%s\n' "$owner"
     printf 'updated_at=%s\n' "$ts"
+    [ -z "$retired" ] || printf '%s\n' "$retired"
     [ -z "$named_ref" ] || printf 'named_ref=%s\n' "$named_ref"
     [ -z "$named_ref" ] || printf 'named_epoch=%s\n' "$named_epoch"
     [ -z "$named_at" ] || printf 'named_at=%s\n' "$named_at"
   } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
   mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   return 0
+}
+
+# Retire only the resumable seat while preserving identity and pane marks. The
+# seat becomes a tombstone (retired_session=, newest first, at most 8 kept): a
+# retired thread stays loaded in a shared app-server for as long as that server
+# lives, and each later fresh seat of this role must still subtract every one
+# of them when it infers its own thread (#579), not only the last.
+agmsg_role_session_forget_seat() {
+  local team="$1" agent="$2" path dir tmp line retired="" older="" kept=0
+  _agmsg_role_session_path_into "$team" "$agent"
+  path="$_AGMSG_ROLE_SESSION_PATH"
+  [ -f "$path" ] || return 0
+  dir="$(_actas_lock_dir)"
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      session=*) retired="${line#session=}" ;;
+      retired_session=*) older="${older:+$older$'\n'}${line#retired_session=}" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$path" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  {
+    [ -z "$retired" ] || { printf 'retired_session=%s\n' "$retired"; kept=1; }
+    while IFS= read -r line; do
+      [ -n "$line" ] && [ "$line" != "$retired" ] || continue
+      [ "$kept" -lt 8 ] || break
+      printf 'retired_session=%s\n' "$line"; kept=$((kept + 1))
+    done <<EOF_RETIRED
+$older
+EOF_RETIRED
+  } >> "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  [ -z "$(_agmsg_role_session_field "$path" session)" ]
 }
 
 # The naming mark: "agmsg named the pane <ref> for this (team, agent)". It is a
@@ -324,10 +363,9 @@ agmsg_role_session_uuid() {
   _agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" session
 }
 
-# Print the session id of every record of <type>, one per line (unordered, may
-# repeat across teams). Empty if none. Used by codex seat resolution (#579) to
-# subtract already-claimed threads from the app-server's loaded set: what is left
-# is the session that has not been seated yet.
+# Print every active or retired session id of <type>, one per line (unordered,
+# may repeat). Retired ids are not authoritative seats, but sticky loaded threads
+# must still be subtracted when resolving an older Codex session (#579).
 agmsg_role_session_recorded_uuids() {
   local type="$1" dir f t v
   [ -n "$type" ] || return 0
@@ -339,6 +377,7 @@ agmsg_role_session_recorded_uuids() {
     [ "$t" = "$type" ] || continue
     v="$(_agmsg_role_session_field "$f" session)"
     [ -n "$v" ] && printf '%s\n' "$v"
+    sed -n 's/^retired_session=//p' "$f" 2>/dev/null | grep . || true
   done
   return 0
 }
