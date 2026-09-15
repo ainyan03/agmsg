@@ -961,6 +961,14 @@ fi
 # watcher attaching.
 [ "$WAIT_READY" = "1" ] && rm -f "$READY_PATH" 2>/dev/null || true
 
+# Revoke the old seat before a normal fresh launch; its despawned app-server is
+# already gone. A shared orphan can still consume until its child's next tick
+# (at most 2s), or until actas when only the bridge survived (#149).
+if [ -z "$RESUME_UUID" ]; then
+  agmsg_role_session_forget_seat "$TEAM" "$NAME" \
+    || die "could not retire '$NAME' in team '$TEAM'; refusing to launch a fresh session with the old seat still authoritative"
+fi
+
 place_and_launch
 
 # requirement 1 arm 3 (herdr): the boot was typed, but the pane's pre-input readiness

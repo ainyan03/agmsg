@@ -18,6 +18,13 @@ setup() {
   cat > "$STUB_BIN/record.sh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CAPTURE"
+if [ -n "\${AGMSG_TEST_SEAT_PATH:-}" ]; then
+  if grep -q '^session=' "\$AGMSG_TEST_SEAT_PATH"; then
+    printf 'present\n' > "$TEST_SKILL_DIR/seat-at-launch"
+  else
+    printf 'absent\n' > "$TEST_SKILL_DIR/seat-at-launch"
+  fi
+fi
 printf 'iterm\t/dev/ttys040\t123\tSat_Sep_13_02:10:11_2026\n' > "\${1}.plain-witness"
 EOF
   chmod +x "$STUB_BIN/record.sh"
@@ -224,12 +231,19 @@ seed_resumable() {
   fi
 }
 
+observe_seat_at_launch() {
+  _agmsg_role_session_path_into "$1" "$2"
+  export AGMSG_TEST_SEAT_PATH="$_AGMSG_ROLE_SESSION_PATH"
+}
+
 @test "spawn: resumes the role's prior session when record + transcript exist (#339)" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   seed_resumable myteam alice "sess-uuid-1" "$PROJ" 1
+  observe_seat_at_launch myteam alice
 
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
   [ "$status" -eq 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/seat-at-launch")" = present ]
   boot="$(cat "$CAPTURE")"; run cat "$boot"
   # Resumed by uuid, still named after the role, still runs the actas prompt.
   [[ "$output" == *"--resume sess-uuid-1"* ]]
@@ -240,9 +254,11 @@ seed_resumable() {
 @test "spawn: --fresh forces a fresh session even when resumable (#339)" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   seed_resumable myteam alice "sess-uuid-1" "$PROJ" 1
+  observe_seat_at_launch myteam alice
 
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --fresh
   [ "$status" -eq 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/seat-at-launch")" = absent ]
   boot="$(cat "$CAPTURE")"; run cat "$boot"
   [[ "$output" != *"--resume"* ]]
   [[ "$output" == *"-n myteam-alice"* ]]   # naming still applies
@@ -251,11 +267,27 @@ seed_resumable() {
 @test "spawn: falls back to fresh when the record's transcript is gone (#339)" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   seed_resumable myteam alice "sess-uuid-1" "$PROJ" 0   # record only, no transcript
+  observe_seat_at_launch myteam alice
 
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
   [ "$status" -eq 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/seat-at-launch")" = absent ]
   boot="$(cat "$CAPTURE")"; run cat "$boot"
   [[ "$output" != *"--resume"* ]]
+}
+
+@test "spawn: refuses a fresh boot when the old seat cannot be retired" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  seed_resumable myteam alice "sess-uuid-1" "$PROJ" 1
+  chmod 500 "$TEST_SKILL_DIR/run"
+
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --fresh
+  local rc="$status"
+  chmod 700 "$TEST_SKILL_DIR/run"
+
+  [ "$rc" -ne 0 ]
+  [ ! -e "$CAPTURE" ]
+  printf '%s\n' "$output" | grep -q "refusing to launch a fresh session"
 }
 
 @test "spawn: a fresh role (no record) boots fresh (#339)" {
