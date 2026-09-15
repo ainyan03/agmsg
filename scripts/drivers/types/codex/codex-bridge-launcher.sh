@@ -631,6 +631,28 @@ appserver_file="$RUN_DIR/codex-bridge.$bridge_key.appserver"
 # appears for a bridge first launched on "loaded", it is torn down and relaunched
 # on the recorded thread instead of clinging to the ambiguous "loaded" one.
 thread_file="$RUN_DIR/codex-bridge.$bridge_key.thread"
+retire_bound_bridge() {
+  local bridge_pid="" lease cur myhost i
+  local lproj lpairs lhost lpid lstart lstartsrc
+  IFS= read -r bridge_pid < "$pidfile" 2>/dev/null || true
+  _agmsg_pid_valid "$bridge_pid" || return 0
+  lease="$RUN_DIR/codex-bridge-lease.$bridge_pid"
+  _read_lease "$lease" || return 0
+  myhost="$(hostname 2>/dev/null)"
+  [ -n "$myhost" ] && [ "$lpid" = "$bridge_pid" ] && [ "$lhost" = "$myhost" ] \
+    && [ "$lproj" = "$PROJECT_HASH" ] && [ "$lpairs" = "$BRIDGE_PAIRS_HASH" ] || return 0
+  cur="$(_start_token "$bridge_pid")" || return 0
+  [ "$cur" = "$lstartsrc$TAB$lstart" ] || return 0
+  kill "$bridge_pid" 2>/dev/null || return 0
+  for i in {1..20}; do
+    if ! _agmsg_pid_alive "$bridge_pid"; then
+      rm -f "$pidfile" "$appserver_file" "$thread_file"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 0
+}
 # An explicit AGMSG_CODEX_BRIDGE_CMD is a complete runnable (tests, custom
 # wrappers) — run it as-is. Only the default codex-bridge.js is launched through
 # a resolved Node, since its env-node shebang fails where a version-manager Node
@@ -674,6 +696,20 @@ while _agmsg_pid_alive_local "$PARENT_PID"; do
   fi
   deregistered_ticks=0
 
+  # Check seat authority before the safety fingerprint can re-exec this child:
+  # the replacement startup path deliberately waits on an absent seat and would
+  # otherwise leave the old binding's sidecars behind on the shared app-server.
+  IFS="$TAB" read -r team name <<EOF
+$ids
+EOF
+  agmsg_role_session_load "$team" "$name" 2>/dev/null || true
+  rec_project_phys="$(agmsg_canonical_path "$AGMSG_ROLE_SESSION_PROJECT" 2>/dev/null || printf '%s' "$AGMSG_ROLE_SESSION_PROJECT")"
+  if [ -z "$AGMSG_ROLE_SESSION_UUID" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ]; then
+    retire_bound_bridge
+    poll_sleep
+    continue
+  fi
+
   # actas can join a second role after SessionStart. Re-exec through the same
   # safety filter when the registration set changes, replacing the old bridge
   # so the new role is actually subscribed instead of being stranded.
@@ -711,9 +747,9 @@ EOF
   rec_owner="$AGMSG_ROLE_SESSION_OWNER"
   rec_project_phys="$(agmsg_canonical_path "$rec_project" 2>/dev/null || printf '%s' "$rec_project")"
   if [ -z "$rec_thread" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ]; then
-    # A role with no record (or one seated in another project) stays
-    # deliberately unsubscribed (#150) and waits for a record to appear. That
-    # wait is open-ended, so it has to be the cheapest path in the file.
+    # A shared app-server child must not keep delivering to the old thread after
+    # its seat disappears or moves projects. Retire that binding before waiting.
+    retire_bound_bridge
     poll_sleep
     continue
   fi

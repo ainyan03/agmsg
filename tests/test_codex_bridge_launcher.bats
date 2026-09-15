@@ -75,6 +75,8 @@ _pairs_hash="$(printf '%s' "$(printf '%s' "$_ph" | LC_ALL=C sort | sed '/^$/d')"
     "$_pairs_hash" \
     "$(hostname)" "$$" "$_start" "$_ssrc" ; } > "$_lease.tmp" && mv "$_lease.tmp" "$_lease"
 trap 'rm -f "$_lease"' EXIT
+[ -z "${MOCK_BRIDGE_IGNORE_TERM:-}" ] || trap '' TERM
+[ -z "${MOCK_BRIDGE_EXEC_SLEEP:-}" ] || exec sleep "$MOCK_BRIDGE_SLEEP"
 [ -z "${MOCK_BRIDGE_SLEEP:-}" ] || sleep "$MOCK_BRIDGE_SLEEP"
 exit 0
 EOF
@@ -186,6 +188,40 @@ run_launcher() {
   done
 }
 
+start_bound_launcher() { # [sticky]
+  export MOCK_BRIDGE_SLEEP=25
+  export MOCK_BRIDGE_EXEC_SLEEP=1
+  if [ "${1:-}" = sticky ]; then export MOCK_BRIDGE_IGNORE_TERM=1
+  else unset MOCK_BRIDGE_IGNORE_TERM
+  fi
+  sleep 60 3>&- & TEST_PARENT_PID=$!
+  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$TEST_PARENT_PID" >/dev/null 2>&1 3>&- &
+  TEST_DISPATCHER_PID=$!
+  local pidfile="$RUN_DIR/codex-bridge.team.alice.pid" i
+  for i in {1..100}; do
+    TEST_BRIDGE_PID="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$TEST_BRIDGE_PID" ] && [ -f "$RUN_DIR/codex-bridge-lease.$TEST_BRIDGE_PID" ] \
+      && kill -0 "$TEST_BRIDGE_PID" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+assert_bound_bridge_retired() {
+  local pidfile="$RUN_DIR/codex-bridge.team.alice.pid" i
+  for i in {1..100}; do
+    if kill -0 "$TEST_BRIDGE_PID" 2>/dev/null; then
+      :
+    elif [ ! -e "$pidfile" ]; then
+      [ ! -e "$RUN_DIR/codex-bridge.team.alice.appserver" ]
+      [ ! -e "$RUN_DIR/codex-bridge.team.alice.thread" ]
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 @test "launcher: binds the recorded thread when the record's project matches (#350)" {
   put_record team alice rec-thread-1 "$PROJ" codex
   run_launcher
@@ -220,6 +256,45 @@ run_launcher() {
   put_record team alice other-thread "/some/other/project" codex
   run_launcher
   [ ! -f "$CAPTURE" ]
+}
+
+@test "launcher: retires a bound bridge when its seat is forgotten" {
+  put_record team alice rec-thread-1 "$PROJ" codex
+  start_bound_launcher
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c \
+    'source "$1/lib/role-session.sh"; agmsg_role_session_forget_seat team alice' _ "$SCRIPTS"
+  assert_bound_bridge_retired
+}
+
+@test "launcher: retires a bound bridge when its seat moves projects" {
+  put_record team alice rec-thread-1 "$PROJ" codex
+  start_bound_launcher
+  put_record team alice rec-thread-2 "$TEST_SKILL_DIR/other-project" codex
+  assert_bound_bridge_retired
+}
+
+@test "launcher: a mismatched lease cannot authorize retirement" {
+  put_record team alice rec-thread-1 "$PROJ" codex
+  start_bound_launcher
+  local lease="$RUN_DIR/codex-bridge-lease.$TEST_BRIDGE_PID"
+  awk '{ if ($0 ~ /^start=/) print "start=1"; else print }' "$lease" > "$lease.x"; mv "$lease.x" "$lease"
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c \
+    'source "$1/lib/role-session.sh"; agmsg_role_session_forget_seat team alice' _ "$SCRIPTS"
+  sleep 3
+  kill -0 "$TEST_BRIDGE_PID"
+  [ -e "$RUN_DIR/codex-bridge.team.alice.pid" ]
+}
+
+@test "launcher: keeps sidecars when bridge exit is unconfirmed" {
+  put_record team alice rec-thread-1 "$PROJ" codex
+  start_bound_launcher sticky
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c \
+    'source "$1/lib/role-session.sh"; agmsg_role_session_forget_seat team alice' _ "$SCRIPTS"
+  sleep 3
+  kill -0 "$TEST_BRIDGE_PID"
+  [ -e "$RUN_DIR/codex-bridge.team.alice.pid" ]
+  [ -e "$RUN_DIR/codex-bridge.team.alice.appserver" ]
+  [ -e "$RUN_DIR/codex-bridge.team.alice.thread" ]
 }
 
 @test "launcher: writes the bound-thread file so a later launcher can rebind (#350)" {
